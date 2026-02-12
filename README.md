@@ -5,5 +5,5 @@ Ahamed TCHATAKOURA<sup>1#</sup>, Marie BUYSSE<sup>1#</sup>, Florence Nono Almeid
 <sup>#</sup> co-first authors\
 <sup>*</sup> co-last authors\
 
-< This repository includes all the scripts used in the study.
+> This repository includes all the scripts used in the study.
 
