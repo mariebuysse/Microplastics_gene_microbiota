@@ -3,6 +3,6 @@ Ahamed TCHATAKOURA<sup>1#</sup>, Marie BUYSSE<sup>1#</sup>, Florence Nono Almeid
 <sup>1</sup> UMR MIVEGEC, Université de Montpellier, IRD, CNRS, Montpellier, France\
 <sup>2</sup> Entente Interdépartementale pour la démoustication du littoral méditerranéen, Montpellier, France\
 <sup>#</sup> co-first authors\
-<sup>*</sup> co-last authors\
+<sup>*</sup> co-last authors
 
 > This repository details command lines used in the production of this manuscript.
