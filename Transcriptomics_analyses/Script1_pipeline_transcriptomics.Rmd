@@ -1,0 +1,186 @@
+---
+title: "Transcriptomics' pipeline analysis"
+subtitle: "Microplastic exposure alters immune-related gene expression in *Culex quinquefasciatus* mosquitoes and larval microbiota diversity"
+author: "Ahamed TCHATAKOURA, Marie BUYSSE, Marie-Laure SETIER RIO, Olivier ROUX, Claire LOISEAU, Amandine AVILES"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width  = 8,
+  fig.height = 5,
+  dpi     = 150
+)
+```
+
+# 0. Raw data quality check
+Samples were sequenced across two separate runs (two run-specific folders). This script matches corresponding files between the two run folders (based on a run-specific ID pattern) and concatenates them into a single FASTQ file per sample.
+```
+DIR1="run1"          # First sequencing run folder
+DIR2="run2"          # Second sequencing run folder
+OUTPUT_DIR="combined_data"
+
+mkdir -p "$OUTPUT_DIR"
+
+# Detect the run-specific ID pattern in each folder
+# (based on the first file found in each folder)
+PATTERN1=$(ls "$DIR1" | head -n 1 | grep -oE "A[0-9A-Z]{7}")
+PATTERN2=$(ls "$DIR2" | head -n 1 | grep -oE "A[0-9A-Z]{7}")
+
+# Check that both patterns were successfully detected 
+if [[ -z "$PATTERN1" || -z "$PATTERN2" ]]; then
+    echo "Could not detect the distinct run ID patterns"
+    exit 1
+fi
+
+# Loop over files in the first run folder 
+for file1 in "$DIR1"/*.fastq.gz; do
+    # File name without the path
+    filename=$(basename "$file1")
+
+    # Build the corresponding file name in the second run folder
+    file2="$DIR2/${filename/$PATTERN1/$PATTERN2}"
+
+    # Check that the matching file exists in the second run folder
+    if [[ -f "$file2" ]]; then
+        # New file name, replacing the run ID pattern with "combined"
+        new_filename="${filename//$PATTERN1/combined}"
+        new_filename="${new_filename//$PATTERN2/combined}"
+
+        # Concatenate the two files
+        cat "$file1" "$file2" > "$OUTPUT_DIR/$new_filename"
+        echo "Combined files: $file1 + $file2 -> $OUTPUT_DIR/$new_filename"
+    else
+        echo "No matching file found for $file1"
+    fi
+done
+```
+
+Runs FastQC on the raw FASTQ files (before trimming).
+```
+LOCAL_FASTQ_DIR="raw_data"
+FASTQC_OUTPUT_DIR="results_fastqc_raw"
+
+module load FastQC/0.12.1
+mkdir -p "$FASTQC_OUTPUT_DIR"
+fastqc -t 4 -o "$FASTQC_OUTPUT_DIR" "$LOCAL_FASTQ_DIR"/*.fastq.gz
+```
+
+Aggregates the per-sample FastQC reports (from the raw reads, step 01) into a single MultiQC report.
+```
+FASTQC_RESULTS="results_fastqc_raw"
+OUTPUT_DIR="results_multiqc_raw"
+
+module load multiqc/1.9
+multiqc "$FASTQC_RESULTS" -o "$OUTPUT_DIR"
+```
+
+# 1. Trimming
+Runs fastp on each paired-end sample (R1/R2), producing cleaned FASTQ files plus per-sample HTML/JSON QC reports.
+```
+RAW_DIR="raw_data"
+OUTPUT_DIR="results_trimming_fastp"
+ADAPTER_FASTA="adapters.fa"
+
+module load fastp/0.20.1
+
+# Build the list of R1 files and select this array task's sample
+R1_FILES=($(ls ${RAW_DIR}/*_R1.fastq.gz | sort))
+R1=${R1_FILES}
+R2=${R1/_R1.fastq.gz/_R2.fastq.gz}
+
+# Sample name for output files
+SAMPLE=$(basename ${R1} | sed 's/_R1.fastq.gz//')
+
+# Run fastp
+fastp \
+  -i "${R1}" \
+  -I "${R2}" \
+  -o "${OUTPUT_DIR}/${SAMPLE}_clean_R1.fastq.gz" \
+  -O "${OUTPUT_DIR}/${SAMPLE}_clean_R2.fastq.gz" \
+  --disable_adapter_trimming \
+  --adapter_fasta "${ADAPTER_FASTA}" \
+  --html "${OUTPUT_DIR}/${SAMPLE}_fastp.html" \
+  --json "${OUTPUT_DIR}/${SAMPLE}_fastp.json" \
+  -w "${SLURM_CPUS_PER_TASK}"
+```
+
+# 2. Build the HISAT2 genome index
+Builds the HISAT2 index from the reference genome FASTA file, used downstream for read alignment. 
+```
+GENOME_DIR="reference_genome"
+GENOME_FASTA="${GENOME_DIR}/reference_genome.fasta"
+INDEX_PREFIX="${GENOME_DIR}/genome_index"
+
+module load hisat2/2.2.1
+hisat2-build "${GENOME_FASTA}" "${INDEX_PREFIX}"
+```
+
+# 3. Read alignment with HISAT2
+Aligns each trimmed paired-end sample to the reference genome index (built in step 04), and outputs a coordinate-sorted BAM file per sample. Runs as a SLURM array job, one task per sample.
+```
+FASTQ_DIR="results_trimming_fastp"
+INDEX_DIR="reference_genome"
+INDEX="${INDEX_DIR}/genome_index/genome_index"
+OUTPUT_DIR="hisat2_mapped"
+
+module load hisat2/2.2.1
+module load samtools/1.19.2
+
+mkdir -p "${OUTPUT_DIR}"
+
+# Build the list of R1 files and select this array task's sample
+R1_FILES=($(ls ${FASTQ_DIR}/*_R1_trimmed.fastq.gz | sort))
+R1=${R1_FILES}
+R2=${R1/_R1_trimmed.fastq.gz/_R2_trimmed.fastq.gz}
+
+# Sample name for the output file
+SAMPLE=$(basename ${R1} | sed 's/_R1_trimmed.fastq.gz//')
+OUT="${OUTPUT_DIR}/${SAMPLE}.sorted.bam"
+
+echo "Starting mapping for ${SAMPLE}..."
+echo "Input files: ${R1} and ${R2}"
+
+# Alignment, then convert to a coordinate-sorted BAM
+hisat2 -x ${INDEX} \
+    -1 ${R1} \
+    -2 ${R2} | \
+samtools view -bS - | \
+samtools sort -o ${OUT}
+
+echo "Mapping done for ${SAMPLE}. Output file: ${OUT}"
+```
+
+# 4. Gene-level read quantification with featureCounts
+Counts paired-end fragments per gene from the sorted/marked BAM files, using the reference GTF annotation, producing a single merged count matrix across all samples.
+```
+ANNOTATION_GTF="reference_genome/annotation.gtf"
+BAM_DIR="picardTool_results/ddFilesMark"
+OUTPUT_DIR="featureCounts_results"
+
+module load singularity/4.0.1
+module load subread/2.0.6
+
+mkdir -p "$OUTPUT_DIR"
+
+# Run featureCounts in paired-end + fragment counting mode
+featureCounts \
+  -T 4 \
+  -p \
+  --countReadPairs \
+  -t exon \
+  -g gene_id \
+  -a "$ANNOTATION_GTF" \
+  -o "$OUTPUT_DIR/featureCounts_all_samples.txt" \
+  "$BAM_DIR"/*.bam
+```
+
